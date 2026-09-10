@@ -1,5 +1,5 @@
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, RwLock};
 use std::thread;
 
@@ -49,26 +49,12 @@ fn main() {
     );
     println!();
 
-    let listener = {
-        let addr: std::net::SocketAddr = format!("{}:{}", node.host, node.port)
-            .parse()
-            .expect("bad addr");
-        let socket = socket2::Socket::new(
-            socket2::Domain::IPV4,
-            socket2::Type::STREAM,
-            Some(socket2::Protocol::TCP),
-        )
-        .expect("socket creation failed");
-        socket.set_reuse_address(true).expect("set_reuse_address");
-        socket.set_nonblocking(true).ok();
-        socket
-            .bind(&addr.into())
-            .expect("Failed to bind MEMNET port");
-        socket.listen(128).expect("Failed to listen on MEMNET port");
-        socket.set_nonblocking(false).ok();
-        TcpListener::from(socket)
-    };
-    println!("MEMNET listening on :{}", node.port);
+    // AyeFire covenant: no IP networking. The daemon binds a LOCAL unix
+    // socket — there is no network path into Aye, hence no backdoor.
+    let sock_path = std::env::var("AYEOSD_SOCK").unwrap_or_else(|_| "/tmp/ayeosd.sock".into());
+    let _ = std::fs::remove_file(&sock_path);
+    let listener = UnixListener::bind(&sock_path).expect("bind ayeosd socket");
+    println!("MEMNET listening on {sock_path} — local only, no IP");
     println!("commands: matrix, capsule [name], list, load <path>, stats, seed, help, quit");
     println!();
 
@@ -254,7 +240,7 @@ fn print_help() {
     println!("  quit            — shutdown");
 }
 
-fn handle_memnet(mut stream: TcpStream, store: &Arc<RwLock<Vec<NamedMatrix>>>, node: &MemnetNode) {
+fn handle_memnet(mut stream: UnixStream, store: &Arc<RwLock<Vec<NamedMatrix>>>, node: &MemnetNode) {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     let mut buf = [0u8; 1024];
     if let Ok(n) = stream.read(&mut buf) {
