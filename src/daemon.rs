@@ -4,8 +4,8 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 
 use ayeos::{
-    genesis, genesis_node, seed_hash_hex, MemnetAddress, MemnetCapsule, MemnetNode, TernaryMatrix,
-    LINOSV_SEED,
+    genesis, genesis_node, seed_hash_hex, FmTuner, HqaCmd, HqaFrame, MemnetAddress, MemnetCapsule,
+    MemnetNode, Mt6631Controller, TernaryMatrix, AYEOS_MT6631_VERSION, LINOSV_SEED,
 };
 
 /// A named ternary matrix loaded from a capsule.
@@ -55,7 +55,9 @@ fn main() {
     let _ = std::fs::remove_file(&sock_path);
     let listener = UnixListener::bind(&sock_path).expect("bind ayeosd socket");
     println!("MEMNET listening on {sock_path} — local only, no IP");
-    println!("commands: matrix, capsule [name], list, load <path>, stats, seed, help, quit");
+    println!(
+        "commands: matrix, capsule [name], list, load <path>, mt6631, stats, seed, help, quit"
+    );
     println!();
 
     let store_clone = Arc::clone(&store);
@@ -69,7 +71,7 @@ fn main() {
     });
 
     let stdin = BufReader::new(std::io::stdin());
-    for line in stdin.lines().flatten() {
+    for line in stdin.lines().map_while(Result::ok) {
         let trimmed = line.trim().to_string();
         let parts: Vec<&str> = trimmed.splitn(2, ' ').collect();
         let cmd = parts[0];
@@ -151,6 +153,7 @@ fn main() {
                 let nm = store.first().unwrap();
                 print_stats(&nm.matrix);
             }
+            "mt6631" | "fm" => print_mt6631_status(),
             "seed" => println!("{}", LINOSV_SEED),
             "help" => print_help(),
             "quit" | "exit" => break,
@@ -217,15 +220,55 @@ fn print_capsule(m: &TernaryMatrix, _node: &MemnetNode, name: &str) {
 }
 
 fn print_stats(m: &TernaryMatrix) {
-    println!("ayeOS v0.2.0");
+    println!("ayeOS v{AYEOS_MT6631_VERSION}");
     print_matrix_stats(m);
     println!();
     println!("architecture:");
-    println!("  CPU (hearth):  kernel8 — Rust x86_64 kernel, cooperative async executor");
+    println!("  CPU (hearth):  kernel8 — Rust bare-metal kernel, cooperative async executor");
     println!("  GPU (brain):   MLX-QUANT — ternary Metal kernels, 12.80x compression");
+    println!("  CONNSYS:       MT6631 (0x1800_0000) — hqa_frame (0x18142880) + Off-Grid FM/RDS (0x1800_6000)");
     println!("  COORD:         vaked — capability-graph language, flake-native");
     println!("  MESH:          MEMNET — contextual routing, intent-based resolution");
     println!("  CAPSULES:      Hot-load trained ternary models via 'load <path>'");
+}
+
+fn print_mt6631_status() {
+    let mut ctrl = Mt6631Controller::new();
+    let chip_resp = ctrl
+        .dispatch_hqa(HqaFrame::new(HqaCmd::GetChipId, 0))
+        .unwrap();
+    ctrl.load_demo_offgrid_broadcast();
+    let (mhz_hi, mhz_lo) = FmTuner::split_mhz(ctrl.fm.current_freq_100khz);
+    let ps = core::str::from_utf8(&ctrl.rds.ps_name).unwrap_or("????????");
+    let rt = core::str::from_utf8(&ctrl.rds.radio_text)
+        .unwrap_or("")
+        .trim_end();
+    let cap = core::str::from_utf8(&ctrl.rds.capsule_buf).unwrap_or("");
+    println!(
+        "MT6631 CONNSYS (0x1800_0000) — ayeOS v{}",
+        AYEOS_MT6631_VERSION
+    );
+    println!(
+        "  gate:      {:?} ({:?}) — safe boot_b fallback",
+        ctrl.gate.stage, ctrl.gate.backend
+    );
+    println!(
+        "  hqa_frame: magic=0x{:08X} ChipID=0x{:04X} wifi={} MHz",
+        chip_resp.magic_no, chip_resp.param, ctrl.wifi_channel_mhz
+    );
+    println!(
+        "  FMSYS:     {}.{} MHz ({} x 100 kHz) RSSI={} dBuV SNR={} dB",
+        mhz_hi, mhz_lo, ctrl.fm.current_freq_100khz, ctrl.fm.rssi_dbuv, ctrl.fm.snr_db
+    );
+    println!(
+        "  RDS:       PI=0x{:04X} PS=\"{}\" RT=\"{}\"",
+        ctrl.rds.pi_code, ps, rt
+    );
+    println!(
+        "  CAPSULE:   \"{}\" (64x36 WavePool energy={})",
+        cap,
+        ctrl.wave_pool.total_energy()
+    );
 }
 
 fn print_help() {
@@ -234,6 +277,7 @@ fn print_help() {
     println!("  capsule [name]  — show MEMNET capsule JSON for named matrix");
     println!("  list            — list all loaded capsules");
     println!("  load <path> [n] — load a trained quantal capsule JSON");
+    println!("  mt6631          — show MT6631 CONNSYS hqa_frame + Off-Grid FM/RDS status");
     println!("  stats           — show full system stats");
     println!("  seed            — print the LINOSV seed text");
     println!("  help            — this message");
