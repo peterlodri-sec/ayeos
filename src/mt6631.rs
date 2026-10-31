@@ -696,11 +696,108 @@ impl WavePool64x36 {
 #[derive(Clone, Copy)]
 pub struct Mt6631Controller {
     pub gate: ConnsysGate,
+    pub wmt_manifest: WmtPatchManifest,
+    pub afe_route: AfeFmRoute,
     pub wifi_channel_mhz: u32,
     pub tx_power_dbm_x2: u16,
     pub fm: FmTuner,
     pub rds: RdsDecoder,
     pub wave_pool: WavePool64x36,
+}
+
+/// MediaTek WMT Firmware Patch & RAM Code Readiness Manifest (`/vendor/firmware/`).
+///
+/// Tracks whether `WIFI_RAM_CODE_6768`, `mt6631_patch_e1_hdr.bin`, and `mt6631_fm_v1_patch.bin`
+/// have been staged into CONNSYS EMI/SYSRAM before releasing the internal MCU reset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WmtPatchManifest {
+    /// `WIFI_RAM_CODE_6768` staged (`true` when Wi-Fi/HQA MCU image is loaded).
+    pub wifi_ram_code_loaded: bool,
+    /// `mt6631_patch_e1_hdr.bin` WMT MCU patch staged.
+    pub wmt_mcu_patch_loaded: bool,
+    /// `mt6631_fm_v1_patch.bin` FMSYS DSP coefficient patch staged.
+    pub fm_dsp_patch_loaded: bool,
+    /// 4-byte ASCII build year prefix from the 28-byte MediaTek WMT patch header (e.g. `*b"2026"`).
+    pub build_year_tag: [u8; 4],
+}
+
+impl Default for WmtPatchManifest {
+    fn default() -> Self {
+        Self::new_unloaded()
+    }
+}
+
+impl WmtPatchManifest {
+    pub const fn new_unloaded() -> Self {
+        Self {
+            wifi_ram_code_loaded: false,
+            wmt_mcu_patch_loaded: false,
+            fm_dsp_patch_loaded: false,
+            build_year_tag: *b"0000",
+        }
+    }
+
+    /// Validates a 16-byte prefix of a MediaTek WMT patch header (`YYYYMMDD...`, e.g. `2020..2029`).
+    pub const fn verify_wmt_patch_header(hdr16: &[u8; 16]) -> bool {
+        hdr16[0] == b'2'
+            && hdr16[1] == b'0'
+            && (hdr16[2] >= b'1' && hdr16[2] <= b'9')
+            && (hdr16[3] >= b'0' && hdr16[3] <= b'9')
+    }
+
+    /// Returns `true` only when both WMT MCU and FMSYS DSP patches are staged for live RF operation.
+    pub const fn is_rf_ready(&self) -> bool {
+        self.wifi_ram_code_loaded && self.wmt_mcu_patch_loaded && self.fm_dsp_patch_loaded
+    }
+}
+
+/// MT6768 Audio Front End (`AFE` `0x1122_0000`) -> MT6358 PMIC FM I2S Interconnect Route.
+///
+/// Mirrors the `audio_device.xml` FM kctl path (`CONNSYS_I2S_IN -> O00/O01` / `HW_GAIN1 -> DL1`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AfeFmRoute {
+    /// `AFE_DAC_CON0` (`0x1122_0000`) bit 0 (`AFE_ON`).
+    pub afe_on: bool,
+    /// `AFE_CONNSYS_I2S_CON` (`0x1122_0478`) enabled (`48 kHz` slave I2S from MT6631 FMSYS).
+    pub connsys_i2s_in_en: bool,
+    /// `AFE_CONN0` / `AFE_CONN1` crossbar (`I00 -> O03`, `I01 -> O04`) into MT6358 DL1 DAC.
+    pub crossbar_dl1_linked: bool,
+    /// Integer digital hardware gain (`0..=255`, `128` = `0 dB` unity).
+    pub hw_gain_step: u8,
+}
+
+impl Default for AfeFmRoute {
+    fn default() -> Self {
+        Self::new_muted()
+    }
+}
+
+impl AfeFmRoute {
+    pub const fn new_muted() -> Self {
+        Self {
+            afe_on: false,
+            connsys_i2s_in_en: false,
+            crossbar_dl1_linked: false,
+            hw_gain_step: 0,
+        }
+    }
+
+    /// Activates the `48 kHz` CONNSYS I2S -> AFE crossbar -> MT6358 DL1 audio path.
+    pub fn enable_fm_audio_path(&mut self, hw_gain_step: u8) {
+        self.afe_on = true;
+        self.connsys_i2s_in_en = true;
+        self.crossbar_dl1_linked = true;
+        self.hw_gain_step = hw_gain_step;
+    }
+
+    /// Encodes the `AFE_CONNSYS_I2S_CON` (`0x1122_0478`) 32-bit register word for `48 kHz` I2S slave mode.
+    pub const fn encode_connsys_i2s_con(&self) -> u32 {
+        if !self.connsys_i2s_in_en {
+            return 0;
+        }
+        // Bit 0: I2S_EN, Bit 3: I2S_FMT (I2S), Bits [11:8] = 0x9 (48 kHz mode), Bit 31: CONNSYS_MODE
+        (1u32 << 31) | (0x9u32 << 8) | (1u32 << 3) | 1u32
+    }
 }
 
 impl Default for Mt6631Controller {
@@ -714,6 +811,8 @@ impl Mt6631Controller {
     pub const fn new() -> Self {
         Self {
             gate: ConnsysGate::new_safe(),
+            wmt_manifest: WmtPatchManifest::new_unloaded(),
+            afe_route: AfeFmRoute::new_muted(),
             wifi_channel_mhz: 2412,
             tx_power_dbm_x2: 36, // 18.0 dBm in 0.5 dBm integer steps
             fm: FmTuner::new(),
@@ -921,5 +1020,23 @@ mod tests {
         let mut pool = WavePool64x36::new();
         pool.inject_oversampled_frame(&ramp, 35);
         assert!(pool.total_energy() > 0);
+    }
+
+    #[test]
+    fn test_wmt_patch_manifest_and_afe_fm_route() {
+        let mut ctrl = Mt6631Controller::new();
+        assert!(!ctrl.wmt_manifest.is_rf_ready());
+        assert_eq!(ctrl.afe_route.encode_connsys_i2s_con(), 0);
+
+        let hdr = *b"20261101MT6631E1";
+        assert!(WmtPatchManifest::verify_wmt_patch_header(&hdr));
+        ctrl.wmt_manifest.wifi_ram_code_loaded = true;
+        ctrl.wmt_manifest.wmt_mcu_patch_loaded = true;
+        ctrl.wmt_manifest.fm_dsp_patch_loaded = true;
+        ctrl.wmt_manifest.build_year_tag = [hdr[0], hdr[1], hdr[2], hdr[3]];
+        assert!(ctrl.wmt_manifest.is_rf_ready());
+
+        ctrl.afe_route.enable_fm_audio_path(128);
+        assert_eq!(ctrl.afe_route.encode_connsys_i2s_con(), 0x8000_0909);
     }
 }
